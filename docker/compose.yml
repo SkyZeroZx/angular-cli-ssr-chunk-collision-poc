@@ -1,0 +1,82 @@
+# The site of the README behind nginx, each part in its own container.
+#   front: visitors, the attacker, the proxy and the sign-up API
+#   back:  the proxy and the Angular server
+name: chunk-lab
+
+x-lab: &lab
+  image: chunk-lab
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  init: true
+
+services:
+  # The record store: where people sign up and create projects.
+  store:
+    <<: *lab
+    command: node store.mjs
+    environment:
+      STORE_HOST: 0.0.0.0
+    networks: [front]
+
+  # `ng build`, as a CI job with 2 CPUs. It shares the network of the store, because the application
+  # reads it at 127.0.0.1:4400.
+  build:
+    <<: *lab
+    profiles: [job]
+    command:
+      - sh
+      - -c
+      - |
+        if [ -n "$LAB_FIX" ]; then node docker/unique-chunk-names.mjs; fi
+        npx ng build && { node tools/check-dist.mjs || true; }
+    environment:
+      LAB_FIX: ${LAB_FIX:-}
+    network_mode: service:store
+    cpuset: '0,1'
+    volumes: [dist:/lab/dist]
+
+  # The scaffold's server.mjs, as built. SERVER=docker/strict.mjs runs it with the workaround set.
+  app:
+    <<: *lab
+    command: node ${SERVER:-dist/ng-chunk-collition/server/server.mjs}
+    environment:
+      NG_ALLOWED_HOSTS: site.test
+    volumes: [dist:/lab/dist:ro]
+    networks: [back]
+
+  # Two containers on one host are a few tens of microseconds apart, closer than two machines.
+  # This gives the server's interface the round trip of a real link. It runs once and exits.
+  link:
+    <<: *lab
+    profiles: [job]
+    command: tc qdisc replace dev eth0 root netem delay ${RTT:-300us}
+    network_mode: service:app
+    cap_add: [NET_ADMIN]
+
+  # The official image with its own nginx.conf. One CPU, so `worker_processes auto` starts one worker.
+  proxy:
+    image: nginx:${NGINX:-1.30.6}
+    cpuset: ${PROXY_CPUS:-0}
+    volumes:
+      - ./nginx/${PROXY:-keepalive}.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      front:
+        aliases: [site.test]
+      back: {}
+
+  # Visitors and the attacker.
+  client:
+    <<: *lab
+    profiles: [job]
+    environment:
+      STORE: http://store:4400
+      SITE: http://site.test
+    networks: [front]
+
+networks:
+  front: {}
+  back: {}
+
+volumes:
+  dist: {}
